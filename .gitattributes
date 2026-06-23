@@ -1,2 +1,55 @@
-# Auto detect text files and perform LF normalization
+# ============================================================
+#  Bambu dashboard .gitattributes
+#  Line endings + Git LFS + source-archive exclusions
+#  NOTE: run `git lfs install` once before committing.
+# ============================================================
+
+# ---------- Line endings ----------
 * text=auto
+
+*.ino        text
+*.c          text
+*.cpp        text
+*.h          text
+*.hpp        text
+*.md         text
+*.txt        text
+*.csv        text
+*.json       text
+*.properties text
+
+# KiCad project files are TEXT — keep diffable, do NOT put in LFS
+#*.kicad_pro  text
+#*.kicad_prl  text
+#*.kicad_sch  text
+#*.kicad_pcb  text
+#*.kicad_dru  text
+#*.kicad_sym  text
+#*.kicad_mod  text
+#*.net        text
+#*.ipc        text
+
+# ---------- Git LFS: 3D / CAD ----------
+#*.step  filter=lfs diff=lfs merge=lfs -text
+#*.stp   filter=lfs diff=lfs merge=lfs -text
+#*.stl   filter=lfs diff=lfs merge=lfs -text
+#*.3mf   filter=lfs diff=lfs merge=lfs -text
+#*.f3d   filter=lfs diff=lfs merge=lfs -text
+#*.FCStd filter=lfs diff=lfs merge=lfs -text
+
+# ---------- Git LFS: archives ----------
+*.zip   filter=lfs diff=lfs merge=lfs -text
+
+# ---------- Git LFS: images / datasheets ----------
+*.png   filter=lfs diff=lfs merge=lfs -text
+*.jpg   filter=lfs diff=lfs merge=lfs -text
+*.jpeg  filter=lfs diff=lfs merge=lfs -text
+*.pdf   filter=lfs diff=lfs merge=lfs -text
+
+# ---------- Exclude from generated source archives ----------
+# Applies to `git archive` AND GitHub's auto "Source code (zip/tar.gz)".
+# Keeps the release source archive focused on firmware.
+#/hardware       export-ignore
+/.github        export-ignore
+.gitattributes  export-ignore
+.gitignore      export-ignore

@@ -1,0 +1,71 @@
+# ============================================================
+#  Bambu dashboard .gitignore
+#  Stack: Arduino (Seeeduino nRF52) + KiCad + Windows
+#  NOTE: comments must be on their OWN line. A "#" after a
+#  pattern on the same line becomes part of the pattern.
+# ============================================================
+
+#-----------Secrets-------------------
+secrets.h
+
+# ---------- Arduino / build artifacts ----------
+build/
+**/build/
+*.hex
+*.bin
+*.elf
+*.map
+*.ino.zip
+*.o
+*.d
+.theia/
+.arduinoIDE/
+
+# ---------- KiCad: auto-generated, never useful in git ----------
+# timestamped backup zips KiCad makes on every save
+*-backups/
+# autosave working files
+_autosave-*
+# editor lock files
+*.lck
+# footprint info cache (regenerated)
+fp-info-cache
+# legacy symbol cache
+*-cache.lib
+*.bak
+*.kicad_pcb-bak
+*.kicad_sch-bak
+
+# Per-user, machine-local project state (UI layout, last-used settings).
+# Common to ignore; remove this line if you want to share it.
+*.kicad_prl
+
+# Ad-hoc manual archives of the board (not a real deliverable)
+*.kicad_pcb.zip
+
+# ---------- Regenerable manufacturing outputs ----------
+# Fab outputs are re-exportable from the .kicad_pcb; keep them out of git.
+**/pcbway_production/
+**/*_gerber.zip
+
+# ---------- Interactive BOM (regenerable) ----------
+# Uncomment if you also want iBOM out of the repo.
+**/bom/ibom.html
+
+# ---------- OS noise ----------
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+# macOS (in case a collaborator is on Mac)
+.DS_Store
+.AppleDouble
+# Linux backup tilde files
+*~
+
+# ---------- Editors ----------
+.vscode/
+.idea/
+*.code-workspace
+*.swp
