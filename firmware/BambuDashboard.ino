@@ -117,6 +117,19 @@ uint16_t hexToRGB565(String hex) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
+// Číslo z JSONu (číslo nebo řetězec); false, pokud klíč chybí / není číselný
+static bool readNumber(JsonVariant v, double &out) {
+  if (v.isNull()) return false;
+  if (v.is<double>() || v.is<long>() || v.is<unsigned long>()) { out = v.as<double>(); return true; }
+  if (v.is<const char*>()) {
+    const char* s = v.as<const char*>();
+    char* end;
+    out = strtod(s, &end);
+    return end != s;
+  }
+  return false;
+}
+
 static void unpackTemp(uint32_t packed, float &cur, float &tgt) {
   cur = (float)(packed & 0xFFFF);
   tgt = (float)((packed >> 16) & 0xFFFF);
@@ -425,14 +438,23 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (p.containsKey("bed_temper"))        bed_temp = p["bed_temper"].as<float>();
   if (p.containsKey("bed_target_temper")) bed_target = p["bed_target_temper"].as<float>();
 
-  // print.device.ctc.info.temp je zabalené stejně jako u trysek: (target<<16)|current
-  // (bez vyhřívání je target 0, takže hodnota vypadá jako prostá teplota)
-  JsonVariant ctcTemp = p["device"]["ctc"]["info"]["temp"];
-  if (ctcTemp.is<float>() || ctcTemp.is<int>() || ctcTemp.is<unsigned int>()) {
-    unpackTemp((uint32_t)ctcTemp.as<double>(), chamber_temp, chamber_target);
-  } else {
-    if (p.containsKey("chamber_temper"))        chamber_temp = p["chamber_temper"].as<float>();
-    if (p.containsKey("chamber_target_temper")) chamber_target = p["chamber_target_temper"].as<float>();
+  // Komora: print.device.ctc.info.temp i chamber_temper mohou být zabalené jako u trysek
+  // ((target<<16)|current). Bez vyhřívání je target 0 a hodnota vypadá jako prostá teplota,
+  // proto se rozbaluje vše, co je >= 65536. Jakmile přijde zabalená hodnota, target se bere
+  // jen z ní (chamber_target_temper pak tiskárna posílá jako 0).
+  static bool chamber_packed = false;
+  double v;
+  if (readNumber(p["chamber_temper"], v)) {
+    if (v >= 65536.0) { unpackTemp((uint32_t)v, chamber_temp, chamber_target); chamber_packed = true; }
+    else chamber_temp = (float)v;
+  }
+  if (readNumber(p["device"]["ctc"]["info"]["temp"], v)) {
+    if (v >= 65536.0) { unpackTemp((uint32_t)v, chamber_temp, chamber_target); chamber_packed = true; }
+    else { chamber_temp = (float)v; if (chamber_packed) chamber_target = 0; }
+  }
+  if (!chamber_packed && readNumber(p["chamber_target_temper"], v)) {
+    if (v >= 65536.0) { float dummy; unpackTemp((uint32_t)v, dummy, chamber_target); }
+    else chamber_target = (float)v;
   }
   if (p["device"]["airduct"]["modeCur"].is<int>()) air_mode = p["device"]["airduct"]["modeCur"].as<int>();
 
