@@ -332,17 +332,41 @@ void drawNotification(uint16_t bg, uint16_t fg, const char* title, String sub) {
   if (sub != "") printCentered(sub, 184, 260, &FreeSans12pt7b, fg);
 }
 
+// Ochrana OLED proti vypálení: blok hodin se každých CLOCK_SHIFT_MS přesune
+// na náhodnou svislou pozici. Blok = čas (baseline CLOCK_TIME_BASE + offset)
+// a datum (baseline CLOCK_DATE_BASE + offset), přibližně y 180..300 při offsetu 0.
+#define CLOCK_SHIFT_MS   (5UL * 60UL * 1000UL)
+#define CLOCK_TIME_BASE  250
+#define CLOCK_DATE_BASE  290
+#define CLOCK_BLOCK_TOP  175   // horní okraj velkých číslic při offsetu 0 (s rezervou)
+#define CLOCK_BLOCK_BOT  300   // spodní okraj data při offsetu 0 (s rezervou)
+#define CLOCK_MARGIN     10
+int clock_offset = 0;
+unsigned long clock_shift_at = 0;
+
 void drawClockUI() {
   time_t now; time(&now); struct tm *ti = localtime(&now);
   if (ti->tm_year < 100) return;
+
+  if (millis() - clock_shift_at >= CLOCK_SHIFT_MS) {
+    const int minOff = CLOCK_MARGIN - CLOCK_BLOCK_TOP;
+    const int maxOff = (LCD_HEIGHT - CLOCK_MARGIN) - CLOCK_BLOCK_BOT;
+    int n = clock_offset;
+    for (int i = 0; i < 10 && abs(n - clock_offset) < 40; i++) n = random(minOff, maxOff + 1);
+    clock_offset = n;
+    clock_shift_at = millis();
+    gfx->fillScreen(COLOR_BG);
+    last_clock_min = -1;
+  }
+
   if (last_clock_min != ti->tm_min) {
-    gfx->fillRect(0, 150, 368, 180, COLOR_BG);
+    gfx->fillRect(0, CLOCK_BLOCK_TOP + clock_offset, 368, CLOCK_BLOCK_BOT - CLOCK_BLOCK_TOP, COLOR_BG);
     char buf[10]; sprintf(buf, "%02d:%02d", ti->tm_hour, ti->tm_min);
     gfx->setFont(&FreeSansBold24pt7b); gfx->setTextSize(2); gfx->setTextColor(COLOR_TEXT);
     int16_t x1, y1; uint16_t tw, th; gfx->getTextBounds(buf, 0, 0, &x1, &y1, &tw, &th);
-    gfx->setCursor(184 - (tw / 2), 250); gfx->print(buf);
+    gfx->setCursor(184 - (tw / 2), CLOCK_TIME_BASE + clock_offset); gfx->print(buf);
     char dateBuf[20]; sprintf(dateBuf, "%02d.%02d.%04d", ti->tm_mday, ti->tm_mon + 1, ti->tm_year + 1900);
-    printCentered(dateBuf, 184, 290, &FreeSans12pt7b, COLOR_GRAY);
+    printCentered(dateBuf, 184, CLOCK_DATE_BASE + clock_offset, &FreeSans12pt7b, COLOR_GRAY);
     last_clock_min = ti->tm_min;
   }
 }
@@ -510,25 +534,42 @@ void setup() {
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
 
   espClient.setInsecure();
+  espClient.setHandshakeTimeout(5);   // s
+  client.setSocketTimeout(5);         // s
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   client.setBufferSize(32768);
 }
 
+// Neblokující pokus o připojení – jeden pokus nejvýš jednou za MQTT_RETRY_MS,
+// aby při vypnuté tiskárně běžel loop() dál (hodiny se aktualizují).
+#define MQTT_RETRY_MS    10000UL
+#define OFFLINE_AFTER_MS 60000UL  // tak dlouho bez spojení -> data považujeme za neplatná
+unsigned long last_mqtt_try = 0;
+unsigned long last_mqtt_ok  = 0;
+
 void reconnect() {
-  while (!client.connected()) {
-    if (client.connect("ESP32_Dashboard", mqtt_user, mqtt_password)) {
-      client.subscribe((String("device/") + serial_number + "/report").c_str());
-      client.publish((String("device/") + serial_number + "/request").c_str(),
-                     "{\"pushing\": {\"sequence_id\": \"1\", \"command\": \"pushall\"}}");
-    } else delay(5000);
+  if (last_mqtt_try != 0 && millis() - last_mqtt_try < MQTT_RETRY_MS) return;
+  last_mqtt_try = millis();
+  if (client.connect("ESP32_Dashboard", mqtt_user, mqtt_password)) {
+    client.subscribe((String("device/") + serial_number + "/report").c_str());
+    client.publish((String("device/") + serial_number + "/request").c_str(),
+                   "{\"pushing\": {\"sequence_id\": \"1\", \"command\": \"pushall\"}}");
   }
+  last_mqtt_try = millis();   // interval počítat od konce pokusu (connect může chvíli blokovat)
 }
 
 void loop() {
   if (WiFi.status() == WL_CONNECTED) {
     if (!client.connected()) reconnect();
-    client.loop();
+    if (client.connected()) client.loop();
+  }
+
+  if (client.connected()) {
+    last_mqtt_ok = millis();
+  } else if (millis() - last_mqtt_ok > OFFLINE_AFTER_MS && gcode_state != "OFFLINE") {
+    // tiskárna nedostupná: zahodit starý stav, aby nezůstal viset dashboard/notifikace
+    gcode_state = "OFFLINE"; print_error = 0;
   }
   updateUI();
   static unsigned long last_time_update = 0;
