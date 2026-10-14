@@ -425,11 +425,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (p.containsKey("bed_temper"))        bed_temp = p["bed_temper"].as<float>();
   if (p.containsKey("bed_target_temper")) bed_target = p["bed_target_temper"].as<float>();
 
-  if (p["device"]["ctc"]["info"]["temp"].is<float>() || p["device"]["ctc"]["info"]["temp"].is<int>())
-    chamber_temp = p["device"]["ctc"]["info"]["temp"].as<float>();
-  else if (p.containsKey("chamber_temper")) chamber_temp = p["chamber_temper"].as<float>();
-
-  if (p.containsKey("chamber_target_temper")) chamber_target = p["chamber_target_temper"].as<float>();
+  // print.device.ctc.info.temp je zabalené stejně jako u trysek: (target<<16)|current
+  // (bez vyhřívání je target 0, takže hodnota vypadá jako prostá teplota)
+  JsonVariant ctcTemp = p["device"]["ctc"]["info"]["temp"];
+  if (ctcTemp.is<float>() || ctcTemp.is<int>() || ctcTemp.is<unsigned int>()) {
+    unpackTemp((uint32_t)ctcTemp.as<double>(), chamber_temp, chamber_target);
+  } else {
+    if (p.containsKey("chamber_temper"))        chamber_temp = p["chamber_temper"].as<float>();
+    if (p.containsKey("chamber_target_temper")) chamber_target = p["chamber_target_temper"].as<float>();
+  }
   if (p["device"]["airduct"]["modeCur"].is<int>()) air_mode = p["device"]["airduct"]["modeCur"].as<int>();
 
   // --- PROGRES / STAV ---
