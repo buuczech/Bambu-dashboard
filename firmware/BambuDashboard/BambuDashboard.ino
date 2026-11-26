@@ -66,11 +66,15 @@ Adafruit_XCA9554 expander;
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
 Arduino_SH8601 *gfx = new Arduino_SH8601(bus, GFX_NOT_DEFINED, 0, LCD_WIDTH, LCD_HEIGHT);
 
-// Jeden off-screen buffer na celou šířku – kreslíme po pásech a posíláme najednou
-// (žádné blikání). 368 x 130 px.
+// Off-screen buffer na celou šířku – pás dashboardu (až 130 px) se kreslí v lokálních
+// souřadnicích a posílá na displej po částech výšky FB_H. ESP32-C6 nemá PSRAM, celý pás
+// (368x130x2 = 95 KB) by s Wi-Fi + 2x TLS + 2x MQTT bufferem nevešel do RAM -> 368 x 65 (47 KB).
 #define FB_W 368
-#define FB_H 130
+#define FB_H 65
 GFXcanvas16 *fb = nullptr;
+int fb_oy = 0;   // svislý posun právě kreslené části pásu (0, FB_H, ...)
+// Pozn.: žádné funkce před definicí struktur níže – Arduino IDE vkládá automatické
+// prototypy před první funkci a typy Printer/Filament by tam ještě neexistovaly.
 
 // ---------------------------------------------------------
 // BAREVNÁ PALETA
@@ -242,19 +246,20 @@ void printCentered(String text, int cx, int by, const GFXfont *font, uint16_t co
   gfx->setCursor(cx - (tw / 2), by); gfx->print(text);
 }
 
-// Vycentrovaný text do off-screen bufferu.
+// Vycentrovaný text do off-screen bufferu (by = souřadnice v pásu, posun fb_oy se odečte).
 void fbCentered(String text, int cx, int by, const GFXfont *font, uint16_t color) {
   fb->setFont(font); fb->setTextSize(1); fb->setTextColor(color);
   int16_t x1, y1; uint16_t tw, th;
   fb->getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
-  fb->setCursor(cx - (tw / 2), by); fb->print(text);
+  fb->setCursor(cx - (tw / 2), by - fb_oy); fb->print(text);
 }
 
-// Vykreslí jednu kartu do bufferu na lokální pozici (cx, cy).
+// Vykreslí jednu kartu do bufferu na pozici (cx, cy) v pásu.
 void drawCardInto(int cx, int cy, int w, int h, String title, String val1, String val2,
                   uint16_t valColor, bool isActive, Filament f = Filament()) {
   uint16_t bg = isActive ? COLOR_CARD_ACTIVE : COLOR_CARD;
-  fb->fillRoundRect(cx, cy, w, h, 12, bg);
+  int ly = cy - fb_oy;   // pro přímé kreslení do bufferu (fbCentered posun řeší sám)
+  fb->fillRoundRect(cx, ly, w, h, 12, bg);
   fbCentered(title, cx + w / 2, cy + 30, &FreeSans9pt7b, isActive ? COLOR_TEXT : COLOR_GRAY);
   fbCentered(val1,  cx + w / 2, cy + 70, &FreeSansBold18pt7b, valColor);
   if (val2 != "") fbCentered(val2, cx + w / 2, cy + 100, &FreeSans9pt7b, isActive ? COLOR_SUBTEXT : COLOR_GRAY);
@@ -266,9 +271,9 @@ void drawCardInto(int cx, int cy, int w, int h, String title, String val1, Strin
     int16_t bx, by; uint16_t tw, th;
     fb->getTextBounds(s, 0, 0, &bx, &by, &tw, &th);
     int total = 14 + tw, sx = cx + (w - total) / 2;
-    fb->fillCircle(sx + 4, cy + h - 15, 5, f.color);
+    fb->fillCircle(sx + 4, ly + h - 15, 5, f.color);
     fb->setTextColor(COLOR_TEXT);
-    fb->setCursor(sx + 14, cy + h - 10); fb->print(s);
+    fb->setCursor(sx + 14, ly + h - 10); fb->print(s);
   }
 }
 
@@ -305,16 +310,25 @@ void drawPrinterLabel(int idx, bool rotating) {
 #define SINGLE_TOP_Y   60
 #define SINGLE_BOT_Y   220
 
+// Pošle aktuální část pásu (výška h, umístěný na displeji na y) na displej.
+void fbFlush(int y, int h) {
+  gfx->draw16bitRGBBitmap(0, y + fb_oy, fb->getBuffer(), FB_W, min(FB_H, h - fb_oy));
+}
+
+// Každý pás se kreslí v cyklu po částech výšky FB_H: for (fb_oy...) { kreslit; fbFlush(); }
 void renderTopDual(const Printer &P, bool la, bool ra) {
   if (!fb) return;
-  fb->fillScreen(COLOR_BG);
-  drawCardInto(10, 0, 169, 130, "Left Nozzle",
-               String(P.noz_t[0], 0) + " C", "Tgt: " + String(P.noz_tgt[0], 0),
-               COLOR_NOZZLE, la, filamentForTray(P, P.tray[0]));
-  drawCardInto(189, 0, 169, 130, "Right Nozzle",
-               String(P.noz_t[1], 0) + " C", "Tgt: " + String(P.noz_tgt[1], 0),
-               COLOR_NOZZLE, ra, filamentForTray(P, P.tray[1]));
-  gfx->draw16bitRGBBitmap(0, DUAL_TOP_Y, fb->getBuffer(), 368, 130);
+  for (fb_oy = 0; fb_oy < 130; fb_oy += FB_H) {
+    fb->fillScreen(COLOR_BG);
+    drawCardInto(10, 0, 169, 130, "Left Nozzle",
+                 String(P.noz_t[0], 0) + " C", "Tgt: " + String(P.noz_tgt[0], 0),
+                 COLOR_NOZZLE, la, filamentForTray(P, P.tray[0]));
+    drawCardInto(189, 0, 169, 130, "Right Nozzle",
+                 String(P.noz_t[1], 0) + " C", "Tgt: " + String(P.noz_tgt[1], 0),
+                 COLOR_NOZZLE, ra, filamentForTray(P, P.tray[1]));
+    fbFlush(DUAL_TOP_Y, 130);
+  }
+  fb_oy = 0;
 }
 
 void renderMidDual(const Printer &P) {
@@ -322,23 +336,29 @@ void renderMidDual(const Printer &P) {
   uint16_t cc = COLOR_TEXT;
   if (P.air_mode == 1)      cc = COLOR_NOZZLE;  // heating -> červená
   else if (P.air_mode == 0) cc = COLOR_BED;     // cooling -> modrá
-  fb->fillScreen(COLOR_BG);
-  drawCardInto(10, 0, 169, 110, "Heatbed",
-               String(P.bed_temp, 0) + " C", "Tgt: " + String(P.bed_target, 0), COLOR_BED, false);
-  drawCardInto(189, 0, 169, 110, "Chamber",
-               String(P.chamber_temp, 0) + " C", "Tgt: " + String(P.chamber_target, 0), cc, false);
-  gfx->draw16bitRGBBitmap(0, DUAL_MID_Y, fb->getBuffer(), 368, 110);
+  for (fb_oy = 0; fb_oy < 110; fb_oy += FB_H) {
+    fb->fillScreen(COLOR_BG);
+    drawCardInto(10, 0, 169, 110, "Heatbed",
+                 String(P.bed_temp, 0) + " C", "Tgt: " + String(P.bed_target, 0), COLOR_BED, false);
+    drawCardInto(189, 0, 169, 110, "Chamber",
+                 String(P.chamber_temp, 0) + " C", "Tgt: " + String(P.chamber_target, 0), cc, false);
+    fbFlush(DUAL_MID_Y, 110);
+  }
+  fb_oy = 0;
 }
 
 void renderTopSingle(const Printer &P) {
   if (!fb) return;
-  fb->fillScreen(COLOR_BG);
-  drawCardInto(10, 0, 169, 130, "Nozzle",
-               String(P.noz_t[0], 0) + " C", "Tgt: " + String(P.noz_tgt[0], 0),
-               COLOR_NOZZLE, P.noz_tgt[0] >= ACTIVE_TARGET_MIN, filamentForTray(P, P.tray[0]));
-  drawCardInto(189, 0, 169, 130, "Heatbed",
-               String(P.bed_temp, 0) + " C", "Tgt: " + String(P.bed_target, 0), COLOR_BED, false);
-  gfx->draw16bitRGBBitmap(0, SINGLE_TOP_Y, fb->getBuffer(), 368, 130);
+  for (fb_oy = 0; fb_oy < 130; fb_oy += FB_H) {
+    fb->fillScreen(COLOR_BG);
+    drawCardInto(10, 0, 169, 130, "Nozzle",
+                 String(P.noz_t[0], 0) + " C", "Tgt: " + String(P.noz_tgt[0], 0),
+                 COLOR_NOZZLE, P.noz_tgt[0] >= ACTIVE_TARGET_MIN, filamentForTray(P, P.tray[0]));
+    drawCardInto(189, 0, 169, 130, "Heatbed",
+                 String(P.bed_temp, 0) + " C", "Tgt: " + String(P.bed_target, 0), COLOR_BED, false);
+    fbFlush(SINGLE_TOP_Y, 130);
+  }
+  fb_oy = 0;
 }
 
 // Aktuální fáze tisku (stg_cur) -> text. Pro neznámé/H2D kódy vrací "".
@@ -382,21 +402,25 @@ String stageText(int s) {
 
 void renderBottom(const Printer &P, int y) {
   if (!fb) return;
-  fb->fillScreen(COLOR_BG);
-  fbCentered("End: " + getETAStr(P.remaining_time_min), 70, 14, &FreeSans9pt7b, COLOR_GRAY);
-  fbCentered("Rem: " + formatTimeStr(P.remaining_time_min), 298, 14, &FreeSans9pt7b, COLOR_GRAY);
-  fb->fillRoundRect(27, 28, 314, 22, 6, COLOR_CARD);
+  String eta = "End: " + getETAStr(P.remaining_time_min);
+  String rem = "Rem: " + formatTimeStr(P.remaining_time_min);
   int barWidth = map(P.mc_percent, 0, 100, 0, 314);
-  if (barWidth > 0) fb->fillRoundRect(27, 28, barWidth, 22, 6, COLOR_BAMBU);
-  fbCentered(String(P.mc_percent) + " %", 100, 90, &FreeSansBold24pt7b, COLOR_TEXT);
-  fbCentered("Layer " + String(P.current_layer) + " / " + String(P.total_layers), 260, 82, &FreeSans12pt7b, COLOR_GRAY);
-
   // Status fáze tisku pod progress barem
   String st = stageText(P.stg_cur);
   if (st == "" && P.gcode_state == "RUNNING") st = "Printing";
-  if (st != "") fbCentered(st, 184, 120, &FreeSans12pt7b, COLOR_SUBTEXT);
 
-  gfx->draw16bitRGBBitmap(0, y, fb->getBuffer(), 368, 130);
+  for (fb_oy = 0; fb_oy < 130; fb_oy += FB_H) {
+    fb->fillScreen(COLOR_BG);
+    fbCentered(eta, 70, 14, &FreeSans9pt7b, COLOR_GRAY);
+    fbCentered(rem, 298, 14, &FreeSans9pt7b, COLOR_GRAY);
+    fb->fillRoundRect(27, 28 - fb_oy, 314, 22, 6, COLOR_CARD);
+    if (barWidth > 0) fb->fillRoundRect(27, 28 - fb_oy, barWidth, 22, 6, COLOR_BAMBU);
+    fbCentered(String(P.mc_percent) + " %", 100, 90, &FreeSansBold24pt7b, COLOR_TEXT);
+    fbCentered("Layer " + String(P.current_layer) + " / " + String(P.total_layers), 260, 82, &FreeSans12pt7b, COLOR_GRAY);
+    if (st != "") fbCentered(st, 184, 120, &FreeSans12pt7b, COLOR_SUBTEXT);
+    fbFlush(y, 130);
+  }
+  fb_oy = 0;
 }
 
 void drawDashboard(int idx, bool rotating) {
@@ -691,6 +715,31 @@ struct SpiRamAllocator : ArduinoJson::Allocator {
 };
 SpiRamAllocator spiAlloc;
 
+// Filtr: z reportu se do paměti načtou jen klíče, které parseReport() používá.
+// Pushall H2D má desítky kB (hms, net, ipcam, upgrade_state…) – bez filtru by se JSON
+// na ESP32-C6 (bez PSRAM) vedle 2x TLS nemusel vejít.
+JsonDocument json_filter;
+void buildJsonFilter() {
+  JsonObject p = json_filter["print"].to<JsonObject>();
+  const char* keys[] = { "nozzle_temper", "nozzle_target_temper", "bed_temper", "bed_target_temper",
+                         "chamber_temper", "chamber_target_temper", "mc_percent", "mc_remaining_time",
+                         "layer_num", "total_layer_num", "gcode_state", "print_error", "stg_cur" };
+  for (const char* k : keys) p[k] = true;
+
+  JsonObject ext = p["device"]["extruder"]["info"][0].to<JsonObject>();
+  ext["id"] = true; ext["temp"] = true; ext["snow"] = true;
+  p["device"]["ctc"]["info"]["temp"] = true;
+  p["device"]["airduct"]["modeCur"] = true;
+
+  p["ams"]["tray_now"] = true;
+  JsonObject ams = p["ams"]["ams"][0].to<JsonObject>();
+  ams["id"] = true;
+  const char* trayKeys[] = { "id", "tray_sub_brands", "tray_type", "tray_color" };
+  JsonObject tray = ams["tray"][0].to<JsonObject>();
+  JsonObject vt = p["vt_tray"].to<JsonObject>();
+  for (const char* k : trayKeys) { tray[k] = true; vt[k] = true; }
+}
+
 void callback(char* topic, byte* payload, unsigned int length) {
   // topic = device/<serial>/report -> podle sériového čísla najít tiskárnu
   Printer *P = nullptr;
@@ -699,8 +748,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (!P) return;
 
   JsonDocument doc(&spiAlloc);
-  DeserializationError err = deserializeJson(doc, payload, length);
-  if (err) { Serial.printf("[%s] JSON error: %s (%u B)\n", P->name, err.c_str(), length); return; }
+  DeserializationError err = deserializeJson(doc, payload, length, DeserializationOption::Filter(json_filter));
+  if (err) {
+    Serial.printf("[%s] JSON error: %s (%u B, heap %u, max blok %u)\n", P->name, err.c_str(), length,
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    return;
+  }
   if (!doc.containsKey("print")) return;
   parseReport(*P, doc["print"].as<JsonObject>());
 }
@@ -764,7 +817,8 @@ void setup() {
           psramFound() ? COLOR_GRAY : COLOR_ORANGE);
 
   fb = new GFXcanvas16(FB_W, FB_H);   // off-screen buffer (alokace předem)
-  if (!fb || !fb->getBuffer()) bootMsg("Framebuffer alloc FAILED", COLOR_RED);
+  if (!fb || !fb->getBuffer()) { bootMsg("Framebuffer alloc FAILED", COLOR_RED); delete fb; fb = nullptr; }
+  buildJsonFilter();
   bootMsg(String("Free heap: ") + String((int)(ESP.getFreeHeap() / 1024)) + " kB");
 
   bootMsg(String("WiFi: ") + ssid + " ...");
@@ -789,7 +843,8 @@ void setup() {
 #endif
   for (int i = 0; i < NUM_PRINTERS; i++)
     bootMsg(String(printers[i].name) + ": " + printers[i].host);
-  bootMsg(String("Free heap: ") + String((int)(ESP.getFreeHeap() / 1024)) + " kB");
+  bootMsg(String("Free heap: ") + String((int)(ESP.getFreeHeap() / 1024)) + " kB, max blok " +
+          String((int)(ESP.getMaxAllocHeap() / 1024)) + " kB");
   delay(1500);   // ať jde start přečíst; pak hodiny / dashboard
 }
 
@@ -798,12 +853,29 @@ void setup() {
 #define MQTT_RETRY_MS     10000UL
 #define MQTT_RETRY_MAX_MS 60000UL
 #define OFFLINE_AFTER_MS  60000UL  // tak dlouho bez spojení -> data považujeme za neplatná
+#define TCP_CONNECT_MS    5000     // výchozí timeout NetworkClientSecure je 30 s
+#define TLS_MIN_HEAP      45000UL  // méně volné RAM -> TLS handshake vůbec nezkoušet (hrozí pád)
 
 void reconnect(Printer &P, int idx) {
   unsigned long wait = min(MQTT_RETRY_MS << min(P.fails, 3), MQTT_RETRY_MAX_MS);
   if (P.last_try != 0 && millis() - P.last_try < wait) return;
+  P.last_try = millis();
   String clientId = String("ESP32_Dashboard_") + idx;
-  Serial.printf("[%s] MQTT connect %s ... (heap %u)\n", P.name, P.host, ESP.getFreeHeap());
+  Serial.printf("[%s] MQTT connect %s ... (heap %u, max blok %u)\n", P.name, P.host,
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  if (ESP.getFreeHeap() < TLS_MIN_HEAP) {
+    P.fails++;
+    Serial.printf("[%s] malo pameti pro TLS, pokus vynechan\n", P.name);
+    return;
+  }
+  // TCP+TLS spojení napřed s krátkým timeoutem; PubSubClient pak existující spojení použije.
+  if (!P.net.connected() && !P.net.connect(P.host, mqtt_port, TCP_CONNECT_MS)) {
+    P.fails++;
+    P.net.stop();
+    Serial.printf("[%s] TCP/TLS connect failed\n", P.name);
+    P.last_try = millis();
+    return;
+  }
   if (P.mqtt.connect(clientId.c_str(), mqtt_user, P.code)) {
     Serial.printf("[%s] MQTT connected\n", P.name);
     P.fails = 0;
