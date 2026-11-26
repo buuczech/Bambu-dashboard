@@ -11,6 +11,15 @@
 #include <time.h>
 #include <esp_system.h>
 
+// Výpisy vždy přes USB (HW CDC). Na ESP32-C6 je výchozí "USB CDC On Boot: Disabled"
+// a Serial by pak šel na piny UART0 – v Serial monitoru přes USB by nebylo nic vidět.
+#if ARDUINO_USB_CDC_ON_BOOT
+  #define LOG Serial
+#else
+  HWCDC usbLog;
+  #define LOG usbLog
+#endif
+
 // Typy tiskáren (pro P1_TYPE / P2_TYPE v secrets.h)
 #define PRINTER_DUAL    0   // H2D – dvě trysky, vyhřívaná komora
 #define PRINTER_SINGLE  1   // P2S, P1S, X1C… – jedna tryska, bez vyhřívané komory
@@ -55,8 +64,9 @@ const char* mqtt_user = "bblp";
 // ---------------------------------------------------------
 #define LEFT_NOZZLE_ID     1        // id LEVÉ trysky H2D (přehoď na 0, kdyby se prohodily)
 #define ACTIVE_TARGET_MIN  40.0     // cíl nad touto hodnotou = aktivní tryska
-#define FINISH_NOTIFY_MS   300000UL // notifikace "Finished" zobrazená 5 min, pak hodiny
-#define ROTATE_MS          10000UL  // přepínání mezi tiskárnami, když tisknou obě
+#define FINISH_NOTIFY_MS   300000UL // obrazovka "Finished" / "Cancelled" 5 min, pak jen ✓ ve stavovém řádku
+#define ROTATE_MS          10000UL  // přepínání mezi tiskárnami, když jich má víc co ukázat
+#define ROTATE_ALERT_MS    20000UL  // chyba / pauza zůstává při střídání déle
 
 // ---------------------------------------------------------
 // HARDWARE
@@ -111,6 +121,8 @@ struct Printer {
   PubSubClient mqtt;
   unsigned long last_try = 0, last_ok = 0;
   int fails = 0;
+  unsigned long last_msg = 0;          // millis() poslední přijaté zprávy (0 = zatím nic)
+  String log_state = ""; int log_stg = -100, log_perc = -1;   // co bylo naposledy vypsáno
 
   // trysky: [0] = levá (u jednotryskové jediná), [1] = pravá
   float noz_t[2] = {0, 0}, noz_tgt[2] = {0, 0};
@@ -127,12 +139,16 @@ struct Printer {
   int print_error = 0;
   int stg_cur = -99;                   // aktuální fáze tisku (status message)
   String gcode_state = "IDLE";
+  String job = "";                     // název tisku (subtask_name)
 
   Filament ams[16];
   Filament ext;
 
-  bool finish_latch = false;
-  unsigned long finish_at = 0;
+  // Přechody stavu – notifikace jen při skutečném konci tisku (ne po zapnutí displeje,
+  // když tiskárna už hodiny hlásí FINISH / FAILED).
+  unsigned long finish_at = 0;         // millis() přechodu tisk -> FINISH (0 = nebylo)
+  unsigned long cancel_at = 0;         // millis() přechodu tisk -> FAILED bez chyby
+  bool done = false;                   // dotištěno, čeká na odebrání (✓ ve stavovém řádku)
 
   Printer() : mqtt(net) {}
 };
@@ -145,7 +161,7 @@ struct Printer {
 Printer printers[NUM_PRINTERS];
 
 // --- REŽIM DISPLEJE ---
-enum DispMode { M_DASH, M_GREEN, M_ORANGE, M_RED, M_CLOCK };
+enum DispMode { M_DASH, M_GREEN, M_ORANGE, M_RED, M_GRAY, M_CLOCK };
 DispMode last_mode = (DispMode)-1;
 int last_shown = -2;
 bool last_rotating = false;
@@ -164,6 +180,12 @@ bool  force_redraw = true;
 // ---------------------------------------------------------
 // POMOCNÉ FUNKCE
 // ---------------------------------------------------------
+// Stav tisku
+bool isActiveState(const String &s) { return s == "RUNNING" || s == "PREPARE" || s == "SLICING"; }
+bool isPrinting(const Printer &P)   { return isActiveState(P.gcode_state) || P.gcode_state == "PAUSE"; }
+bool hasError(const Printer &P)     { return P.print_error != 0 && P.gcode_state != "OFFLINE"; }
+bool isPaused(const Printer &P)     { return !hasError(P) && P.gcode_state == "PAUSE"; }
+
 uint16_t hexToRGB565(String hex) {
   if (hex.length() < 6) return COLOR_GRAY;
   long rgb = strtol(hex.substring(0, 6).c_str(), NULL, 16);
@@ -281,34 +303,77 @@ void drawCardInto(int cx, int cy, int w, int h, String title, String val1, Strin
 // IDENTIFIKACE TISKÁRNY (malý štítek dole, pod dashboardem)
 // ---------------------------------------------------------
 #define LABEL_Y  418   // pruh 418..448, pod spodním pásem dashboardu
-void drawPrinterLabel(int idx, bool rotating) {
-  gfx->fillRect(0, LABEL_Y, 368, LCD_HEIGHT - LABEL_Y, COLOR_BG);
-  if (NUM_PRINTERS < 2) return;   // s jednou tiskárnou štítek nemá smysl
-  const char* name = printers[idx].name;
-  gfx->setFont(&FreeSans9pt7b); gfx->setTextSize(1);
-  int16_t x1, y1; uint16_t tw, th;
-  gfx->getTextBounds(name, 0, 0, &x1, &y1, &tw, &th);
-  int dotsW = rotating ? 24 : 0;              // dvě tečky: která z obou tiskáren je vidět
-  int sx = 184 - (int)(tw + dotsW) / 2;
-  gfx->setTextColor(COLOR_GRAY);
-  gfx->setCursor(sx, LABEL_Y + 18); gfx->print(name);
-  if (rotating) {
-    int dx = sx + tw + 10;
-    for (int i = 0; i < NUM_PRINTERS; i++)
-      gfx->fillCircle(dx + i * 10, LABEL_Y + 12, 3, i == idx ? COLOR_TEXT : COLOR_DIM);
+
+// Stav spojení tiskárny: 0 = nepřipojeno, 1 = připojeno bez dat, 2 = chodí data.
+// Filtrované časem, aby krátký výpadek / reconnect tečkou neblikal:
+//  - červená až po STATUS_OFFLINE_MS bez spojení,
+//  - zelená, dokud poslední zpráva není starší než STATUS_STALE_MS.
+#define STATUS_OFFLINE_MS  30000UL
+#define STATUS_STALE_MS    30000UL
+int printerStatus(Printer &P) {
+  unsigned long now = millis();
+  if (!P.mqtt.connected() && (P.last_ok == 0 || now - P.last_ok > STATUS_OFFLINE_MS)) return 0;
+  return (P.last_msg != 0 && now - P.last_msg < STATUS_STALE_MS) ? 2 : 1;
+}
+
+// Stav tisku pro stavový řádek: 0 = nic, 1 = chyba, 2 = pauza, 3 = dotištěno (čeká na odebrání)
+int printerFlag(const Printer &P) {
+  if (hasError(P)) return 1;
+  if (isPaused(P)) return 2;
+  if (P.done && P.gcode_state == "FINISH") return 3;
+  return 0;
+}
+
+// Malá zelená "fajfka" (font nemá ✓), levý horní roh boxu 10x10 na (x, y).
+void drawCheck(int x, int y, uint16_t c) {
+  for (int t = 0; t < 2; t++) {               // tloušťka 2 px
+    gfx->drawLine(x, y + 5 + t, x + 3, y + 8 + t, c);
+    gfx->drawLine(x + 3, y + 8 + t, x + 9, y + 1 + t, c);
   }
 }
+
+// Stavový řádek: názvy všech tiskáren + tečka spojení (zelená = chodí data, oranžová =
+// připojeno bez dat, červená = nepřipojeno). Barva názvu: červená = chyba, oranžová = pauza,
+// jinak bílá pro zobrazenou tiskárnu (highlight) a šedá pro ostatní. ✓ = dotištěno.
+// Překresluje se jen při změně; *last = -1 vynutí překreslení.
+void drawStatusStrip(int y, int highlight, int *last) {
+  int code = highlight + 1;
+  for (int i = 0; i < NUM_PRINTERS; i++) code = code * 12 + printerStatus(printers[i]) * 4 + printerFlag(printers[i]);
+  if (code == *last) return;
+  *last = code;
+
+  gfx->fillRect(0, y, 368, 30, COLOR_BG);
+  gfx->setFont(&FreeSans9pt7b); gfx->setTextSize(1);
+  int16_t x1, y1; uint16_t tw, th;
+  int widths[NUM_PRINTERS], textw[NUM_PRINTERS], total = 0;
+  for (int i = 0; i < NUM_PRINTERS; i++) {
+    gfx->getTextBounds(printers[i].name, 0, 0, &x1, &y1, &tw, &th);
+    textw[i] = tw;
+    widths[i] = tw + 16 + (printerFlag(printers[i]) == 3 ? 14 : 0);   // text (+ ✓) + tečka
+    total += widths[i] + (i ? 24 : 0);
+  }
+  int x = 184 - total / 2;
+  for (int i = 0; i < NUM_PRINTERS; i++) {
+    int s = printerStatus(printers[i]), fl = printerFlag(printers[i]);
+    uint16_t dot = s == 0 ? COLOR_RED : (s == 1 ? COLOR_ORANGE : COLOR_GREEN);
+    uint16_t tc  = fl == 1 ? COLOR_RED : fl == 2 ? COLOR_ORANGE : (i == highlight ? COLOR_TEXT : COLOR_GRAY);
+    gfx->setTextColor(tc);
+    gfx->setCursor(x, y + 18); gfx->print(printers[i].name);
+    if (fl == 3) drawCheck(x + textw[i] + 5, y + 6, COLOR_GREEN);
+    gfx->fillCircle(x + widths[i] - 5, y + 12, 4, dot);
+    x += widths[i] + 24;
+  }
+}
+int last_label_code = -1;
 
 // ---------------------------------------------------------
 // PÁSY DASHBOARDU (každý se pošle na displej jedním blokem)
 // ---------------------------------------------------------
-// H2D: trysky (y 15) / podložka+komora (y 155) / progres (y 285)
-// jednotrysková: tryska+podložka (y 60) / progres (y 220)
+// Stejné rozložení pro obě: trysky (y 15) / podložka+komora (y 155) / progres (y 285).
+// Jednotrysková má nahoře jednu kartu přes celou šířku.
 #define DUAL_TOP_Y     15
 #define DUAL_MID_Y     155
 #define DUAL_BOT_Y     285
-#define SINGLE_TOP_Y   60
-#define SINGLE_BOT_Y   220
 
 // Pošle aktuální část pásu (výška h, umístěný na displeji na y) na displej.
 void fbFlush(int y, int h) {
@@ -331,32 +396,39 @@ void renderTopDual(const Printer &P, bool la, bool ra) {
   fb_oy = 0;
 }
 
-void renderMidDual(const Printer &P) {
+// Podložka + komora. H2D: barva komory podle režimu (topí = červená, chladí = modrá) a target.
+// Jednotrysková (P2S…) komoru nevyhřívá: vždy modře a bez targetu.
+void renderMid(const Printer &P) {
   if (!fb) return;
-  uint16_t cc = COLOR_TEXT;
-  if (P.air_mode == 1)      cc = COLOR_NOZZLE;  // heating -> červená
-  else if (P.air_mode == 0) cc = COLOR_BED;     // cooling -> modrá
+  bool dual = (P.type == PRINTER_DUAL);
+  uint16_t cc = COLOR_BED;
+  String ctgt = "";
+  if (dual) {
+    cc = COLOR_TEXT;
+    if (P.air_mode == 1)      cc = COLOR_NOZZLE;  // heating -> červená
+    else if (P.air_mode == 0) cc = COLOR_BED;     // cooling -> modrá
+    ctgt = "Tgt: " + String(P.chamber_target, 0);
+  }
   for (fb_oy = 0; fb_oy < 110; fb_oy += FB_H) {
     fb->fillScreen(COLOR_BG);
     drawCardInto(10, 0, 169, 110, "Heatbed",
                  String(P.bed_temp, 0) + " C", "Tgt: " + String(P.bed_target, 0), COLOR_BED, false);
     drawCardInto(189, 0, 169, 110, "Chamber",
-                 String(P.chamber_temp, 0) + " C", "Tgt: " + String(P.chamber_target, 0), cc, false);
+                 String(P.chamber_temp, 0) + " C", ctgt, cc, false);
     fbFlush(DUAL_MID_Y, 110);
   }
   fb_oy = 0;
 }
 
+// Jedna tryska: karta přes celou šířku (tryska, target, filament).
 void renderTopSingle(const Printer &P) {
   if (!fb) return;
   for (fb_oy = 0; fb_oy < 130; fb_oy += FB_H) {
     fb->fillScreen(COLOR_BG);
-    drawCardInto(10, 0, 169, 130, "Nozzle",
+    drawCardInto(10, 0, 348, 130, "Nozzle",
                  String(P.noz_t[0], 0) + " C", "Tgt: " + String(P.noz_tgt[0], 0),
                  COLOR_NOZZLE, P.noz_tgt[0] >= ACTIVE_TARGET_MIN, filamentForTray(P, P.tray[0]));
-    drawCardInto(189, 0, 169, 130, "Heatbed",
-                 String(P.bed_temp, 0) + " C", "Tgt: " + String(P.bed_target, 0), COLOR_BED, false);
-    fbFlush(SINGLE_TOP_Y, 130);
+    fbFlush(DUAL_TOP_Y, 130);
   }
   fb_oy = 0;
 }
@@ -433,8 +505,9 @@ void drawDashboard(int idx, bool rotating) {
     last_l_tray = last_r_tray = -99; last_l_active = last_r_active = -1;
     last_bed_t = last_bed_tgt = -1; last_cham_t = last_cham_tgt = -1; last_air_mode = -99;
     last_perc = last_rem_min = -1; last_cur_layer = last_tot_layer = -1; last_stg = -100;
-    drawPrinterLabel(idx, rotating);
+    last_label_code = -1;
   }
+  if (NUM_PRINTERS > 1) drawStatusStrip(LABEL_Y, idx, &last_label_code);
 
   if (dual) {
     bool la = (P.active_side == 0), ra = (P.active_side == 1);
@@ -444,24 +517,23 @@ void drawDashboard(int idx, bool rotating) {
       last_l_t = P.noz_t[0]; last_l_tgt = P.noz_tgt[0]; last_l_tray = P.tray[0]; last_l_active = (int)la;
       last_r_t = P.noz_t[1]; last_r_tgt = P.noz_tgt[1]; last_r_tray = P.tray[1]; last_r_active = (int)ra;
     }
-    if (last_bed_t != P.bed_temp || last_bed_tgt != P.bed_target ||
-        last_cham_t != P.chamber_temp || last_cham_tgt != P.chamber_target || last_air_mode != P.air_mode) {
-      renderMidDual(P);
-      last_bed_t = P.bed_temp; last_bed_tgt = P.bed_target;
-      last_cham_t = P.chamber_temp; last_cham_tgt = P.chamber_target; last_air_mode = P.air_mode;
-    }
   } else {
-    if (last_l_t != P.noz_t[0] || last_l_tgt != P.noz_tgt[0] || last_l_tray != P.tray[0] ||
-        last_bed_t != P.bed_temp || last_bed_tgt != P.bed_target) {
+    if (last_l_t != P.noz_t[0] || last_l_tgt != P.noz_tgt[0] || last_l_tray != P.tray[0]) {
       renderTopSingle(P);
       last_l_t = P.noz_t[0]; last_l_tgt = P.noz_tgt[0]; last_l_tray = P.tray[0];
-      last_bed_t = P.bed_temp; last_bed_tgt = P.bed_target;
     }
+  }
+
+  if (last_bed_t != P.bed_temp || last_bed_tgt != P.bed_target ||
+      last_cham_t != P.chamber_temp || last_cham_tgt != P.chamber_target || last_air_mode != P.air_mode) {
+    renderMid(P);
+    last_bed_t = P.bed_temp; last_bed_tgt = P.bed_target;
+    last_cham_t = P.chamber_temp; last_cham_tgt = P.chamber_target; last_air_mode = P.air_mode;
   }
 
   if (last_perc != P.mc_percent || last_rem_min != P.remaining_time_min ||
       last_cur_layer != P.current_layer || last_tot_layer != P.total_layers || last_stg != P.stg_cur) {
-    renderBottom(P, dual ? DUAL_BOT_Y : SINGLE_BOT_Y);
+    renderBottom(P, DUAL_BOT_Y);
     last_perc = P.mc_percent; last_rem_min = P.remaining_time_min;
     last_cur_layer = P.current_layer; last_tot_layer = P.total_layers; last_stg = P.stg_cur;
   }
@@ -472,16 +544,17 @@ void drawDashboard(int idx, bool rotating) {
 // ---------------------------------------------------------
 void drawNotification(int idx, bool rotating, uint16_t bg, uint16_t fg, const char* title, String sub) {
   gfx->fillScreen(bg);
-  if (NUM_PRINTERS > 1) printCentered(printers[idx].name, 184, 160, &FreeSans12pt7b, fg);
+  printCentered(printers[idx].name, 184, 150, &FreeSansBold18pt7b, fg);   // na které tiskárně
   gfx->setFont(&FreeSansBold24pt7b); gfx->setTextSize(1); gfx->setTextColor(fg);
   int16_t x1, y1; uint16_t tw, th;
   gfx->getTextBounds(title, 0, 0, &x1, &y1, &tw, &th);
-  gfx->setCursor(184 - tw / 2, 215); gfx->print(title);
-  if (sub != "") printCentered(sub, 184, 260, &FreeSans12pt7b, fg);
-  if (rotating) {
-    for (int i = 0; i < NUM_PRINTERS; i++)
-      gfx->fillCircle(179 + i * 10, 300, 3, fg);
-    gfx->fillCircle(179 + (idx == 0 ? 10 : 0), 300, 2, bg);   // neaktivní = prázdná tečka
+  gfx->setCursor(184 - tw / 2, 225); gfx->print(title);
+  if (sub != "") printCentered(sub, 184, 275, &FreeSans12pt7b, fg);
+  if (rotating) {   // které z střídaných obrazovek: plná tečka = tato tiskárna
+    for (int i = 0; i < NUM_PRINTERS; i++) {
+      gfx->fillCircle(184 - (NUM_PRINTERS - 1) * 7 + i * 14, 320, 4, fg);
+      if (i != idx) gfx->fillCircle(184 - (NUM_PRINTERS - 1) * 7 + i * 14, 320, 2, bg);
+    }
   }
 }
 
@@ -496,6 +569,13 @@ void drawNotification(int idx, bool rotating, uint16_t bg, uint16_t fg, const ch
 #define CLOCK_MARGIN     10
 int clock_offset = 0;
 unsigned long clock_shift_at = 0;
+int last_status_code = -1;   // -1 = vynutit překreslení stavového řádku
+
+// Stav tiskáren u hodin: řádek je vždy na opačné straně než blok hodin
+// (hodiny dole -> řádek nahoře a naopak), aby se nepřekrývaly.
+void drawClockStatus() {
+  drawStatusStrip((clock_offset > 0) ? 4 : LABEL_Y, -1, &last_status_code);
+}
 
 void drawClockUI() {
   time_t now; time(&now); struct tm *ti = localtime(&now);
@@ -504,6 +584,7 @@ void drawClockUI() {
       printCentered("Syncing time...", 184, CLOCK_TIME_BASE + clock_offset, &FreeSans12pt7b, COLOR_GRAY);
       last_clock_min = -2;
     }
+    drawClockStatus();
     return;
   }
 
@@ -516,6 +597,7 @@ void drawClockUI() {
     clock_shift_at = millis();
     gfx->fillScreen(COLOR_BG);
     last_clock_min = -1;
+    last_status_code = -1;
   }
 
   if (last_clock_min != ti->tm_min) {
@@ -528,26 +610,29 @@ void drawClockUI() {
     printCentered(dateBuf, 184, CLOCK_DATE_BASE + clock_offset, &FreeSans12pt7b, COLOR_GRAY);
     last_clock_min = ti->tm_min;
   }
+  drawClockStatus();
 }
 
 // ---------------------------------------------------------
 // VÝBĚR REŽIMU
 // ---------------------------------------------------------
+// Priorita: chyba > pauza > tisk > dokončeno (5 min) > zrušeno (5 min) > nic (hodiny).
+// Offline tiskárna nikdy obrazovku nezabere (jen červená tečka ve stavovém řádku).
 DispMode computeMode(Printer &P) {
-  bool err    = (P.gcode_state == "FAILED") || (P.print_error != 0);
-  bool paused = (P.gcode_state == "PAUSE");
-  bool active = (P.gcode_state == "RUNNING" || P.gcode_state == "PREPARE" || P.gcode_state == "SLICING");
+  unsigned long now = millis();
+  if (hasError(P))                    return M_RED;
+  if (isPaused(P))                    return M_ORANGE;
+  if (isActiveState(P.gcode_state))   return M_DASH;
+  if (P.gcode_state == "FINISH" && P.finish_at && now - P.finish_at < FINISH_NOTIFY_MS) return M_GREEN;
+  if (P.gcode_state == "FAILED" && P.cancel_at && now - P.cancel_at < FINISH_NOTIFY_MS) return M_GRAY;
+  return M_CLOCK;
+}
 
-  if (active || err || paused) P.finish_latch = false;
-  if (P.gcode_state == "FINISH" && !P.finish_latch && !active && !err && !paused) {
-    P.finish_latch = true; P.finish_at = millis();
-  }
-
-  if (err)    return M_RED;
-  if (paused) return M_ORANGE;
-  if (active) return M_DASH;
-  if (P.finish_latch && (millis() - P.finish_at < FINISH_NOTIFY_MS)) return M_GREEN;
-  return M_CLOCK;   // nečinnost / standby (i po 5 min od dokončení)
+// Kód chyby Bambu se zobrazuje jako XXXX-XXXX (hex), stejně jako na tiskárně / v aplikaci.
+String errorCodeStr(int e) {
+  char buf[16];
+  sprintf(buf, "%04X-%04X", ((uint32_t)e >> 16) & 0xFFFF, (uint32_t)e & 0xFFFF);
+  return String(buf);
 }
 
 void updateUI() {
@@ -567,30 +652,44 @@ void updateUI() {
     shown = firstActive;
   } else if (shown < 0 || modes[shown] == M_CLOCK) {
     shown = firstActive; rotate_at = millis();
-  } else if (millis() - rotate_at >= ROTATE_MS) {
-    // aktivní jsou obě -> střídat
-    do { shown = (shown + 1) % NUM_PRINTERS; } while (modes[shown] == M_CLOCK);
-    rotate_at = millis();
+  } else {
+    // víc tiskáren má co ukázat -> střídat; chyba / pauza zůstává déle
+    unsigned long dwell = (modes[shown] == M_RED || modes[shown] == M_ORANGE) ? ROTATE_ALERT_MS : ROTATE_MS;
+    if (millis() - rotate_at >= dwell) {
+      do { shown = (shown + 1) % NUM_PRINTERS; } while (modes[shown] == M_CLOCK);
+      rotate_at = millis();
+    }
   }
   bool rotating = (activeCount > 1);
   DispMode mode = (shown < 0) ? M_CLOCK : modes[shown];
 
-  // vstup do nového režimu / jiné tiskárny -> jednorázové překreslení
-  if (mode != last_mode || shown != last_shown || rotating != last_rotating) {
-    last_mode = mode; last_shown = shown; last_rotating = rotating;
+  // vstup do nového režimu / jiné tiskárny / změna kódu chyby -> jednorázové překreslení
+  static int last_err_shown = 0;
+  int err_now = (shown >= 0) ? printers[shown].print_error : 0;
+  if (mode != last_mode || shown != last_shown || rotating != last_rotating ||
+      (mode == M_RED && err_now != last_err_shown)) {
+    last_mode = mode; last_shown = shown; last_rotating = rotating; last_err_shown = err_now;
     last_clock_min = -1;
-    if      (mode == M_DASH)   force_redraw = true;
-    else if (mode == M_GREEN)  drawNotification(shown, rotating, COLOR_GREEN,  0x0000, "FINISHED", "Print complete");
-    else if (mode == M_ORANGE) drawNotification(shown, rotating, COLOR_ORANGE, 0x0000, "PAUSED",   "Print paused");
-    else if (mode == M_RED)    drawNotification(shown, rotating, COLOR_RED,    0xFFFF, "ERROR",
-                                  printers[shown].print_error != 0 ? ("Code " + String(printers[shown].print_error))
-                                                                   : "Check printer");
-    else if (mode == M_CLOCK)  gfx->fillScreen(COLOR_BG);
+    if (mode == M_DASH) {
+      force_redraw = true;
+    } else if (mode == M_GREEN) {
+      String job = printers[shown].job;
+      if (job.length() > 24) job = job.substring(0, 22) + "..";
+      drawNotification(shown, rotating, COLOR_GREEN, 0x0000, "FINISHED", job != "" ? job : String("Print complete"));
+    } else if (mode == M_ORANGE) {
+      drawNotification(shown, rotating, COLOR_ORANGE, 0x0000, "PAUSED", "Print paused");
+    } else if (mode == M_RED) {
+      drawNotification(shown, rotating, COLOR_RED, 0xFFFF, "ERROR", "Code " + errorCodeStr(err_now));
+    } else if (mode == M_GRAY) {
+      drawNotification(shown, rotating, COLOR_CARD_ACTIVE, COLOR_TEXT, "CANCELLED", "Print stopped");
+    } else if (mode == M_CLOCK) {
+      gfx->fillScreen(COLOR_BG); last_status_code = -1;
+    }
   }
 
   if (mode == M_DASH)  drawDashboard(shown, rotating);
   else if (mode == M_CLOCK) drawClockUI();
-  // notifikační režimy: overlay zůstává až do vyřešení, nic dalšího se nekreslí
+  // notifikační režimy: obrazovka zůstává až do změny stavu, nic dalšího se nekreslí
 }
 
 // ---------------------------------------------------------
@@ -661,12 +760,12 @@ void parseReport(Printer &P, JsonObject p) {
   readPlainTemp(p["bed_temper"], P.bed_temp);
   readPlainTemp(p["bed_target_temper"], P.bed_target);
 
-  // --- KOMORA (jen H2D) ---
+  // --- KOMORA (H2D i jednotryskové – P2S má čidlo, jen nevyhřívá) ---
   // print.device.ctc.info.temp i chamber_temper mohou být zabalené jako u trysek
   // ((target<<16)|current). Bez vyhřívání je target 0 a hodnota vypadá jako prostá teplota,
   // proto se rozbaluje vše, co je >= 65536. Jakmile přijde zabalená hodnota, target se bere
   // jen z ní (chamber_target_temper pak tiskárna posílá jako 0).
-  if (P.type == PRINTER_DUAL) {
+  {
     double v;
     if (readNumber(p["chamber_temper"], v)) {
       if (v >= 65536.0) { unpackTemp((uint32_t)v, P.chamber_temp, P.chamber_target); P.chamber_packed = true; }
@@ -680,7 +779,7 @@ void parseReport(Printer &P, JsonObject p) {
       if (v >= 65536.0) { float dummy; unpackTemp((uint32_t)v, dummy, P.chamber_target); }
       else P.chamber_target = (float)v;
     }
-    if (p["device"]["airduct"]["modeCur"].is<int>()) P.air_mode = p["device"]["airduct"]["modeCur"].as<int>();
+    if (P.type == PRINTER_DUAL && p["device"]["airduct"]["modeCur"].is<int>()) P.air_mode = p["device"]["airduct"]["modeCur"].as<int>();
   }
 
   // --- PROGRES / STAV ---
@@ -688,7 +787,19 @@ void parseReport(Printer &P, JsonObject p) {
   if (p.containsKey("mc_remaining_time")) P.remaining_time_min = p["mc_remaining_time"].as<int>();
   if (p.containsKey("layer_num"))         P.current_layer = p["layer_num"].as<int>();
   if (p.containsKey("total_layer_num"))   P.total_layers = p["total_layer_num"].as<int>();
-  if (p.containsKey("gcode_state"))       P.gcode_state = p["gcode_state"].as<String>();
+  if (p.containsKey("gcode_state")) {
+    String ns = p["gcode_state"].as<String>();
+    bool wasPrinting = isActiveState(P.gcode_state) || P.gcode_state == "PAUSE";
+    P.gcode_state = ns;
+    if (isPrinting(P)) {                        // nový / pokračující tisk ruší dokončení
+      P.done = false; P.finish_at = 0; P.cancel_at = 0;
+    } else if (wasPrinting && ns == "FINISH") {
+      P.finish_at = millis(); P.done = true;
+    } else if (wasPrinting && ns == "FAILED") {
+      P.cancel_at = millis();                   // zrušeno / selhalo (chybu řeší print_error)
+    }
+  }
+  if (p["subtask_name"].is<const char*>())  P.job = p["subtask_name"].as<String>();
   if (p.containsKey("print_error"))       P.print_error = p["print_error"].as<int>();
   if (p.containsKey("stg_cur"))           P.stg_cur = p["stg_cur"].as<int>();
 
@@ -723,7 +834,7 @@ void buildJsonFilter() {
   JsonObject p = json_filter["print"].to<JsonObject>();
   const char* keys[] = { "nozzle_temper", "nozzle_target_temper", "bed_temper", "bed_target_temper",
                          "chamber_temper", "chamber_target_temper", "mc_percent", "mc_remaining_time",
-                         "layer_num", "total_layer_num", "gcode_state", "print_error", "stg_cur" };
+                         "layer_num", "total_layer_num", "gcode_state", "print_error", "stg_cur", "subtask_name" };
   for (const char* k : keys) p[k] = true;
 
   JsonObject ext = p["device"]["extruder"]["info"][0].to<JsonObject>();
@@ -750,12 +861,20 @@ void callback(char* topic, byte* payload, unsigned int length) {
   JsonDocument doc(&spiAlloc);
   DeserializationError err = deserializeJson(doc, payload, length, DeserializationOption::Filter(json_filter));
   if (err) {
-    Serial.printf("[%s] JSON error: %s (%u B, heap %u, max blok %u)\n", P->name, err.c_str(), length,
+    LOG.printf("[%s] JSON error: %s (%u B, heap %u, max blok %u)\n", P->name, err.c_str(), length,
                   ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     return;
   }
+  P->last_msg = millis();
   if (!doc.containsKey("print")) return;
   parseReport(*P, doc["print"].as<JsonObject>());
+  // vypisovat jen změny (stav / fáze / procenta), ne každý report
+  if (P->gcode_state != P->log_state || P->stg_cur != P->log_stg || P->mc_percent != P->log_perc) {
+    P->log_state = P->gcode_state; P->log_stg = P->stg_cur; P->log_perc = P->mc_percent;
+    LOG.printf("[%s] report %u B: state %s, stg %d, %d %%, noz %.0f/%.0f, bed %.0f/%.0f, cham %.0f/%.0f, tray %d\n",
+               P->name, length, P->gcode_state.c_str(), P->stg_cur, P->mc_percent,
+               P->noz_t[0], P->noz_tgt[0], P->bed_temp, P->bed_target, P->chamber_temp, P->chamber_target, P->tray[0]);
+  }
 }
 
 // ---------------------------------------------------------
@@ -768,15 +887,16 @@ void setupPrinter(Printer &P, const char* name, int type, const char* host, cons
   P.mqtt.setSocketTimeout(5);     // s
   P.mqtt.setServer(host, mqtt_port);
   P.mqtt.setCallback(callback);
-  // H2D posílá velké zprávy; jednotryskovým stačí menší buffer (šetří RAM bez PSRAM)
-  int buf = (type == PRINTER_DUAL || psramFound()) ? 32768 : 20480;
-  if (!P.mqtt.setBufferSize(buf)) Serial.printf("[%s] MQTT buffer %d B: malloc FAILED\n", name, buf);
+  // Zprávu větší než buffer PubSubClient POTICHU zahodí. Pushall H2D i P2S má desítky kB,
+  // proto 32 KB pro obě (RAM ušetřená menším framebufferem na to stačí).
+  int buf = 32768;
+  if (!P.mqtt.setBufferSize(buf)) LOG.printf("[%s] MQTT buffer %d B: malloc FAILED\n", name, buf);
 }
 
 // Stavové řádky při startu (na displej i do Serialu), ať černá obrazovka něco říká.
 int boot_line = 0;
 void bootMsg(String msg, uint16_t color = COLOR_GRAY) {
-  Serial.println(msg);
+  LOG.println(msg);
   printCentered(msg, 184, 60 + boot_line * 26, &FreeSans9pt7b, color);
   boot_line++;
 }
@@ -796,9 +916,12 @@ const char* resetReasonStr(esp_reset_reason_t r) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  LOG.begin(115200);
+  // Bez čtoucího programu na PC by každý zápis čekal až 20x timeout (výchozí 100 ms) a
+  // brzdil smyčku tak, že padalo MQTT. S 0 se výpis prostě zahodí, když ho nikdo nečte.
+  LOG.setTxTimeoutMs(0);
   delay(300);
-  Serial.println("\n=== Bambu dashboard boot ===");
+  LOG.println("\n=== Bambu dashboard boot ===");
   Wire.begin(IIC_SDA, IIC_SCL);
   if (!expander.begin(0x20)) while (1);
   expander.pinMode(4, OUTPUT); expander.pinMode(5, OUTPUT);
@@ -861,30 +984,30 @@ void reconnect(Printer &P, int idx) {
   if (P.last_try != 0 && millis() - P.last_try < wait) return;
   P.last_try = millis();
   String clientId = String("ESP32_Dashboard_") + idx;
-  Serial.printf("[%s] MQTT connect %s ... (heap %u, max blok %u)\n", P.name, P.host,
+  LOG.printf("[%s] MQTT connect %s ... (heap %u, max blok %u)\n", P.name, P.host,
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   if (ESP.getFreeHeap() < TLS_MIN_HEAP) {
     P.fails++;
-    Serial.printf("[%s] malo pameti pro TLS, pokus vynechan\n", P.name);
+    LOG.printf("[%s] malo pameti pro TLS, pokus vynechan\n", P.name);
     return;
   }
   // TCP+TLS spojení napřed s krátkým timeoutem; PubSubClient pak existující spojení použije.
   if (!P.net.connected() && !P.net.connect(P.host, mqtt_port, TCP_CONNECT_MS)) {
     P.fails++;
     P.net.stop();
-    Serial.printf("[%s] TCP/TLS connect failed\n", P.name);
+    LOG.printf("[%s] TCP/TLS connect failed\n", P.name);
     P.last_try = millis();
     return;
   }
   if (P.mqtt.connect(clientId.c_str(), mqtt_user, P.code)) {
-    Serial.printf("[%s] MQTT connected\n", P.name);
+    LOG.printf("[%s] MQTT connected\n", P.name);
     P.fails = 0;
     P.mqtt.subscribe((String("device/") + P.serial + "/report").c_str());
     P.mqtt.publish((String("device/") + P.serial + "/request").c_str(),
                    "{\"pushing\": {\"sequence_id\": \"1\", \"command\": \"pushall\"}}");
   } else {
     P.fails++;
-    Serial.printf("[%s] MQTT failed, state %d\n", P.name, P.mqtt.state());
+    LOG.printf("[%s] MQTT failed, state %d\n", P.name, P.mqtt.state());
   }
   P.last_try = millis();   // interval počítat od konce pokusu (connect může chvíli blokovat)
 }
@@ -902,6 +1025,7 @@ void loop() {
     } else if (millis() - P.last_ok > OFFLINE_AFTER_MS && P.gcode_state != "OFFLINE") {
       // tiskárna nedostupná: zahodit starý stav, aby nezůstal viset dashboard/notifikace
       P.gcode_state = "OFFLINE"; P.print_error = 0;
+      P.done = false; P.finish_at = 0; P.cancel_at = 0;
     }
     updateUI();   // i mezi tiskárnami, ať blokující connect jedné nezdržuje displej
   }
