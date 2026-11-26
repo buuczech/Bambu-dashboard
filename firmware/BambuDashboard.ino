@@ -9,6 +9,7 @@
 #include "pin_config.h"
 #include <Wire.h>
 #include <time.h>
+#include <esp_system.h>
 
 // Typy tiskáren (pro P1_TYPE / P2_TYPE v secrets.h)
 #define PRINTER_DUAL    0   // H2D – dvě trysky, vyhřívaná komora
@@ -474,7 +475,13 @@ unsigned long clock_shift_at = 0;
 
 void drawClockUI() {
   time_t now; time(&now); struct tm *ti = localtime(&now);
-  if (ti->tm_year < 100) return;
+  if (ti->tm_year < 100) {               // NTP ještě nedoběhlo
+    if (last_clock_min != -2) {
+      printCentered("Syncing time...", 184, CLOCK_TIME_BASE + clock_offset, &FreeSans12pt7b, COLOR_GRAY);
+      last_clock_min = -2;
+    }
+    return;
+  }
 
   if (millis() - clock_shift_at >= CLOCK_SHIFT_MS) {
     const int minOff = CLOCK_MARGIN - CLOCK_BLOCK_TOP;
@@ -675,6 +682,15 @@ void parseReport(Printer &P, JsonObject p) {
   if (p["vt_tray"].is<JsonObject>()) readFilament(p["vt_tray"].as<JsonObject>(), P.ext);
 }
 
+// Velké JSON dokumenty (H2D pushall má desítky kB) dávat do PSRAM, je-li k dispozici,
+// ať nedojde vnitřní RAM (framebuffer + 2x TLS + MQTT buffery).
+struct SpiRamAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t n) override { return psramFound() ? ps_malloc(n) : malloc(n); }
+  void deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { return psramFound() ? ps_realloc(p, n) : realloc(p, n); }
+};
+SpiRamAllocator spiAlloc;
+
 void callback(char* topic, byte* payload, unsigned int length) {
   // topic = device/<serial>/report -> podle sériového čísla najít tiskárnu
   Printer *P = nullptr;
@@ -682,8 +698,9 @@ void callback(char* topic, byte* payload, unsigned int length) {
     if (strstr(topic, printers[i].serial)) { P = &printers[i]; break; }
   if (!P) return;
 
-  JsonDocument doc;
-  if (deserializeJson(doc, payload, length)) return;
+  JsonDocument doc(&spiAlloc);
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) { Serial.printf("[%s] JSON error: %s (%u B)\n", P->name, err.c_str(), length); return; }
   if (!doc.containsKey("print")) return;
   parseReport(*P, doc["print"].as<JsonObject>());
 }
@@ -698,10 +715,37 @@ void setupPrinter(Printer &P, const char* name, int type, const char* host, cons
   P.mqtt.setSocketTimeout(5);     // s
   P.mqtt.setServer(host, mqtt_port);
   P.mqtt.setCallback(callback);
-  P.mqtt.setBufferSize(32768);
+  // H2D posílá velké zprávy; jednotryskovým stačí menší buffer (šetří RAM bez PSRAM)
+  int buf = (type == PRINTER_DUAL || psramFound()) ? 32768 : 20480;
+  if (!P.mqtt.setBufferSize(buf)) Serial.printf("[%s] MQTT buffer %d B: malloc FAILED\n", name, buf);
+}
+
+// Stavové řádky při startu (na displej i do Serialu), ať černá obrazovka něco říká.
+int boot_line = 0;
+void bootMsg(String msg, uint16_t color = COLOR_GRAY) {
+  Serial.println(msg);
+  printCentered(msg, 184, 60 + boot_line * 26, &FreeSans9pt7b, color);
+  boot_line++;
+}
+
+const char* resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_SW:       return "software";
+    case ESP_RST_PANIC:    return "CRASH (panic)";
+    case ESP_RST_INT_WDT:  return "CRASH (int WDT)";
+    case ESP_RST_TASK_WDT: return "CRASH (task WDT)";
+    case ESP_RST_WDT:      return "CRASH (WDT)";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_DEEPSLEEP:return "deep sleep";
+    default:               return "other";
+  }
 }
 
 void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== Bambu dashboard boot ===");
   Wire.begin(IIC_SDA, IIC_SCL);
   if (!expander.begin(0x20)) while (1);
   expander.pinMode(4, OUTPUT); expander.pinMode(5, OUTPUT);
@@ -712,11 +756,30 @@ void setup() {
   gfx->setBrightness(255);
   gfx->fillScreen(COLOR_BG);
 
-  fb = new GFXcanvas16(FB_W, FB_H);   // off-screen buffer (alokace předem)
+  esp_reset_reason_t rr = esp_reset_reason();
+  bootMsg(String("Reset: ") + resetReasonStr(rr),
+          (rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
+           rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT) ? COLOR_RED : COLOR_GRAY);
+  bootMsg(String("PSRAM: ") + (psramFound() ? String((int)(ESP.getPsramSize() / 1024)) + " kB" : String("NONE")),
+          psramFound() ? COLOR_GRAY : COLOR_ORANGE);
 
+  fb = new GFXcanvas16(FB_W, FB_H);   // off-screen buffer (alokace předem)
+  if (!fb || !fb->getBuffer()) bootMsg("Framebuffer alloc FAILED", COLOR_RED);
+  bootMsg(String("Free heap: ") + String((int)(ESP.getFreeHeap() / 1024)) + " kB");
+
+  bootMsg(String("WiFi: ") + ssid + " ...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) delay(500);
+  unsigned long wifi_start = millis();
+  bool wifi_warned = false;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    if (!wifi_warned && millis() - wifi_start > 20000) {
+      bootMsg("WiFi not connecting - check SSID/password", COLOR_ORANGE);
+      wifi_warned = true;
+    }
+  }
+  bootMsg(String("WiFi OK, IP ") + WiFi.localIP().toString(), COLOR_GREEN);
 
   configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
 
@@ -724,6 +787,10 @@ void setup() {
 #ifdef P2_IP
   setupPrinter(printers[1], P2_NAME, P2_TYPE, P2_IP, P2_ACCESS_CODE, P2_SERIAL);
 #endif
+  for (int i = 0; i < NUM_PRINTERS; i++)
+    bootMsg(String(printers[i].name) + ": " + printers[i].host);
+  bootMsg(String("Free heap: ") + String((int)(ESP.getFreeHeap() / 1024)) + " kB");
+  delay(1500);   // ať jde start přečíst; pak hodiny / dashboard
 }
 
 // Neblokující pokus o připojení. Interval se při opakovaných neúspěších prodlužuje
@@ -736,13 +803,16 @@ void reconnect(Printer &P, int idx) {
   unsigned long wait = min(MQTT_RETRY_MS << min(P.fails, 3), MQTT_RETRY_MAX_MS);
   if (P.last_try != 0 && millis() - P.last_try < wait) return;
   String clientId = String("ESP32_Dashboard_") + idx;
+  Serial.printf("[%s] MQTT connect %s ... (heap %u)\n", P.name, P.host, ESP.getFreeHeap());
   if (P.mqtt.connect(clientId.c_str(), mqtt_user, P.code)) {
+    Serial.printf("[%s] MQTT connected\n", P.name);
     P.fails = 0;
     P.mqtt.subscribe((String("device/") + P.serial + "/report").c_str());
     P.mqtt.publish((String("device/") + P.serial + "/request").c_str(),
                    "{\"pushing\": {\"sequence_id\": \"1\", \"command\": \"pushall\"}}");
   } else {
     P.fails++;
+    Serial.printf("[%s] MQTT failed, state %d\n", P.name, P.mqtt.state());
   }
   P.last_try = millis();   // interval počítat od konce pokusu (connect může chvíli blokovat)
 }
