@@ -149,6 +149,7 @@ struct Printer {
   unsigned long finish_at = 0;         // millis() přechodu tisk -> FINISH (0 = nebylo)
   unsigned long cancel_at = 0;         // millis() přechodu tisk -> FAILED bez chyby
   bool done = false;                   // dotištěno, čeká na odebrání (✓ ve stavovém řádku)
+  int8_t light = -1;                   // světlo v komoře: -1 neznámé, 0 zhasnuto, 1 svítí
 
   Printer() : mqtt(net) {}
 };
@@ -800,6 +801,19 @@ void parseReport(Printer &P, JsonObject p) {
     }
   }
   if (p["subtask_name"].is<const char*>())  P.job = p["subtask_name"].as<String>();
+  // Úsporný režim: po dotisku (a kliknutí na OK) tiskárna za ~10 min usne a zhasne
+  // světlo v komoře. Kliknutí na OK samo se v MQTT neprojeví, zhasnutí ano -> ruší ✓.
+  if (p["lights_report"].is<JsonArray>()) {
+    for (JsonObject l : p["lights_report"].as<JsonArray>()) {
+      if (strcmp(l["node"] | "", "chamber_light") != 0) continue;
+      int8_t on = strcmp(l["mode"] | "", "off") != 0;
+      if (P.light == 1 && on == 0 && P.done && P.gcode_state == "FINISH") {
+        P.done = false; P.finish_at = 0;
+        LOG.printf("[%s] chamber light off (sleep), finish cleared\n", P.name);
+      }
+      P.light = on;
+    }
+  }
   if (p.containsKey("print_error"))       P.print_error = p["print_error"].as<int>();
   if (p.containsKey("stg_cur"))           P.stg_cur = p["stg_cur"].as<int>();
 
@@ -836,6 +850,8 @@ void buildJsonFilter() {
                          "chamber_temper", "chamber_target_temper", "mc_percent", "mc_remaining_time",
                          "layer_num", "total_layer_num", "gcode_state", "print_error", "stg_cur", "subtask_name" };
   for (const char* k : keys) p[k] = true;
+  p["lights_report"][0]["node"] = true;
+  p["lights_report"][0]["mode"] = true;
 
   JsonObject ext = p["device"]["extruder"]["info"][0].to<JsonObject>();
   ext["id"] = true; ext["temp"] = true; ext["snow"] = true;
